@@ -2,7 +2,6 @@
 
 Konverterer NS 3420 byggebeskrivelse-PDF til regneark (Excel/CSV), NS 3459 XML og JSON.
 
-Kompatibel med [ns3420reader](https://github.com/user/ns3420reader) for videre tilbudsvurdering, kvalitetskontroll og prismatrise.
 
 ## Installasjon
 
