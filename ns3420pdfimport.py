@@ -259,6 +259,12 @@ class CoordinateParser:
 
     KNOWN_UNITS = {'m', 'm2', 'm3', 'stk', 'kg', 'RS', 'tonn', '-', 'måned'}
 
+    @staticmethod
+    def _normalize_unit(unit: str) -> str:
+        """Normalize unit strings: m2->m², m3->m³."""
+        unit = unit.replace('m2', 'm²').replace('m3', 'm³')
+        return unit
+
     def _line_to_row(self, spans, page_num, ch_code, ch_title) -> Optional[dict]:
         """Assign spans to columns and build a row dict."""
         postnr = ""
@@ -311,6 +317,8 @@ class CoordinateParser:
 
         # Merge unit with superscript
         enh = enh_base + enh_super
+        # Normalize: m2->m², m3->m³
+        enh = self._normalize_unit(enh)
         # Validate: if enh still has numbers glued to it, split them off
         if enh and not enh in self.KNOWN_UNITS:
             m = re.match(r'^([a-zA-Z]+\d?)([\d,.]+)$', enh)
@@ -423,6 +431,8 @@ class CoordinateParser:
             spec = row['spec']
             enh = row['enh']
             mengde_str = row['mengde']
+            pris_str = row['pris']
+            sum_str = row['sum']
 
             # Check for section heading (2-level like "05.21" + title)
             if postnr and re.match(r'^\d{2}\.\d{1,3}$', postnr) and spec and not enh:
@@ -478,6 +488,10 @@ class CoordinateParser:
                         current_post.unit = enh
                     if mengde_str and current_post.quantity == 0:
                         current_post.quantity = self._parse_qty(mengde_str)
+                    if pris_str and current_post.unit_price is None:
+                        current_post.unit_price = self._parse_price(pris_str)
+                    if sum_str and current_post.total_price is None:
+                        current_post.total_price = self._parse_price(sum_str)
                 continue
 
             # Row with postnr -> new post or sub-item
@@ -495,6 +509,8 @@ class CoordinateParser:
                     description=desc,
                     unit=enh,
                     quantity=self._parse_qty(mengde_str),
+                    unit_price=self._parse_price(pris_str),
+                    total_price=self._parse_price(sum_str),
                     chapter_code=row['ch_code'],
                     chapter_title=row['ch_title'],
                     section_code=current_section[0],
@@ -511,6 +527,10 @@ class CoordinateParser:
                         current_post.unit = enh
                     if mengde_str and current_post.quantity == 0:
                         current_post.quantity = self._parse_qty(mengde_str)
+                    if pris_str and current_post.unit_price is None:
+                        current_post.unit_price = self._parse_price(pris_str)
+                    if sum_str and current_post.total_price is None:
+                        current_post.total_price = self._parse_price(sum_str)
 
         # Don't forget the last post
         if current_post:
@@ -547,6 +567,19 @@ class CoordinateParser:
             return float(s.strip().replace(' ', '').replace(',', '.'))
         except ValueError:
             return 0.0
+
+    @staticmethod
+    def _parse_price(s: str) -> Optional[float]:
+        """Parse a Norwegian-format price string (comma as decimal separator)."""
+        if not s:
+            return None
+        try:
+            # Norwegian format: periods as thousands separators, comma as decimal
+            cleaned = s.strip().replace(' ', '').replace('.', '').replace(',', '.')
+            val = float(cleaned)
+            return val if val != 0.0 else None
+        except ValueError:
+            return None
 
 
 # ────────────────────────────────────────────────────────────
@@ -876,25 +909,10 @@ class NS3420Parser:
 
     # ── Main parse loop ──
 
-    def _is_context_line(self, line: str) -> bool:
-        """Check if line is meaningful non-post text (section header, context)."""
-        stripped = line.strip().replace('|', ' ').strip()
-        stripped = re.sub(r'-{3,}', '', stripped).strip()
-        if not stripped or len(stripped) < 3:
-            return False
-        # Chapter/section headings like "05 Betongarbeider" or "05.21 Grunn og fundamenter"
-        if re.match(r'^\d{2}(?:\.\d{1,3})?\s+[A-Za-zÆØÅæøå]', stripped):
-            return True
-        # Descriptive text like "Verkstedhall - Smøregraver"
-        if re.match(r'^[A-ZÆØÅa-zæøå][\w\sæøåÆØÅ,.()-]+$', stripped) and len(stripped) > 5:
-            return True
-        return False
-
     def _parse_lines(self, lines: List[str]):
         current_post: Optional[Post] = None
         post_lines: List[str] = []
         found_first_chapter = False
-        pending_context: List[str] = []  # Non-post text between posts
 
         for line in lines:
             raw = line.rstrip()
@@ -918,24 +936,6 @@ class NS3420Parser:
                     self._finalize_post(current_post, post_lines)
                     self.posts.append(current_post)
 
-                # Flush pending context as a text-only row
-                if pending_context:
-                    ctx_text = '\n'.join(
-                        re.sub(r'\s{2,}', ' ', re.sub(r'-{3,}', '', re.sub(r'\|', ' ', l))).strip()
-                        for l in pending_context if l.strip()
-                    )
-                    if ctx_text.strip():
-                        self.posts.append(Post(
-                            description=ctx_text.strip(),
-                            chapter_code=self._ch[0],
-                            chapter_title=self._ch[1],
-                            section_code=self._sec[0],
-                            section_title=self._sec[1],
-                            subject=self._sec[1] or self._ch[1],
-                            page=self._page,
-                        ))
-                    pending_context = []
-
                 pn, code = post_info
                 current_post = Post(
                     post_number=pn,
@@ -951,17 +951,10 @@ class NS3420Parser:
                 # Don't add page/chapter headers to post text
                 if not self.PAGE_RE.search(raw) and not self.CHAPTER_RE.search(raw):
                     post_lines.append(raw)
-            else:
-                # No current post - capture as context if meaningful
-                if self._is_context_line(raw):
-                    pending_context.append(raw)
 
         if current_post:
             self._finalize_post(current_post, post_lines)
             self.posts.append(current_post)
-
-        # Second pass: extract sub-posts from within parent post full_text
-        self._extract_sub_posts()
 
     # ── Post finalization ──
 
@@ -1016,9 +1009,6 @@ class NS3420Parser:
         clean_lines = self._clean_lines(lines)
         clean_text = '\n'.join(clean_lines)
 
-        # Detect sub-item number from next line (e.g., "1.1 GLIDESJIKT")
-        self._detect_sub_number(post, clean_lines)
-
         # Build full description (all spec text)
         post.description = self._build_full_description(post, clean_lines)
 
@@ -1027,167 +1017,11 @@ class NS3420Parser:
 
         post.subject = post.section_title or post.chapter_title
 
-    # Sub-post pattern: "POSTNR. Description\nN    Antallstk XX"
-    SUBPOST_RE = re.compile(
-        r'(?:^|\|)\s*(\d{2}\.\d{2,3}\.\d+(?:\.\d+)*)\.\s*'  # parent postnr with trailing dot
-        r'(.+?)$',  # description text
-        re.MULTILINE
-    )
-    # Sub-number + quantity in next lines
-    SUBQTY_PATTERNS = [
-        re.compile(r'Antall\s*stk\s*([\d,.]+)', re.I),
-        re.compile(r'Areal[^|\n]*?m\s*([\d,.]+)', re.I),
-        re.compile(r'(?:Samlet\s+)?[Ll]engde[^|\n]*?m\s*([\d,.]+)'),
-        re.compile(r'Masse\s*kg\s*([\d,.]+)', re.I),
-        re.compile(r'Volum\s*m\s*([\d,.]+)', re.I),
-    ]
-    SUBUNIT_MAP = {0: 'stk', 1: 'm2', 2: 'm', 3: 'kg', 4: 'm3'}
-
-    def _extract_sub_posts(self):
-        """Extract sub-posts embedded within parent post text.
-
-        Patterns found in NS 3420:
-        1. Table: | 05.24.20.1 Inntil Ø100 | ... | Antallstk 2 |
-        2. Table: | 06.24.1.1 | L x H x T = ... | Arealm 2 50,00 |
-        3. Plain: 03.034.13.\n1\n  Antallstk 26
-        4. Compact: | POSTNR. Description | qty |
-        """
-        new_posts = []
-
-        for parent in self.posts:
-            if not parent.post_number:
-                continue
-
-            text = parent.full_text
-            parent_pn = re.escape(parent.post_number)
-
-            # Clean the full text for searching
-            clean = re.sub(r'\|', ' ', text)
-            clean = re.sub(r'-{3,}', ' ', clean)
-
-            # Pattern A: "PARENT.N description" on ONE line
-            # Matches: 05.24.20.1 Inntil Ø100, 06.24.1.1 L x H x T, etc.
-            sub_re = re.compile(
-                rf'{parent_pn}\.(\d+(?:\.\d+)*)\s*(.*)',
-                re.MULTILINE
-            )
-
-            # Pattern B: "PARENT. description" then "N" on NEXT line (split format)
-            # Matches: 03.034.13. For trekkekum\n1\nAntallstk 26
-            split_re = re.compile(
-                rf'{parent_pn}\.\s*([^\d\n].*?)$',
-                re.MULTILINE
-            )
-
-            # Pass 1: Direct matches (PARENT.N on same line)
-            for m in sub_re.finditer(clean):
-                sub_num = m.group(1)
-                full_pn = f"{parent.post_number}.{sub_num}"
-                desc_text = m.group(2).strip()
-
-                context_start = m.start()
-                context_end = min(len(clean), m.end() + 300)
-                context = clean[context_start:context_end]
-
-                # Extract quantity/unit from context
-                qty = 0.0
-                unit = ""
-                for pi, pat in enumerate(self.SUBQTY_PATTERNS):
-                    qm = pat.search(context)
-                    if qm:
-                        try:
-                            qty = float(qm.group(1).replace(',', '.').replace(' ', ''))
-                            unit = self.SUBUNIT_MAP[pi]
-                            break
-                        except ValueError:
-                            continue
-
-                # Also check for "Arealm 2 N" pattern (m² with split superscript)
-                if not unit:
-                    am = re.search(r'Areal\s*m\s*2\s+([\d,.]+)', context)
-                    if am:
-                        try:
-                            qty = float(am.group(1).replace(',', '.'))
-                            unit = 'm2'
-                        except ValueError:
-                            pass
-
-                # Clean up description
-                desc_text = re.sub(r'\s{2,}', ' ', desc_text)[:200]
-
-                new_posts.append(Post(
-                    post_number=full_pn,
-                    ns3420_code=parent.ns3420_code,
-                    subject=parent.subject,
-                    description=desc_text if desc_text else parent.description,
-                    quantity=qty,
-                    unit=unit,
-                    chapter_code=parent.chapter_code,
-                    chapter_title=parent.chapter_title,
-                    section_code=parent.section_code,
-                    section_title=parent.section_title,
-                    page=parent.page,
-                ))
-
-            # Pass 2: Split matches (PARENT. text\nN\n qty)
-            for m in split_re.finditer(clean):
-                desc_text = m.group(1).strip()
-                # Look for sub-number on subsequent lines
-                after = clean[m.end():m.end() + 200]
-                lines_after = after.strip().split('\n')
-                for la in lines_after[:3]:
-                    la = la.strip()
-                    num_m = re.match(r'^(\d{1,3})\s', la)
-                    if num_m:
-                        sub_num = num_m.group(1)
-                        full_pn = f"{parent.post_number}.{sub_num}"
-                        # Get context for quantity extraction
-                        context = '\n'.join(lines_after[:5])
-
-                        qty = 0.0
-                        unit = ""
-                        for pi, pat in enumerate(self.SUBQTY_PATTERNS):
-                            qm = pat.search(context)
-                            if qm:
-                                try:
-                                    qty = float(qm.group(1).replace(',', '.').replace(' ', ''))
-                                    unit = self.SUBUNIT_MAP[pi]
-                                    break
-                                except ValueError:
-                                    continue
-                        if not unit:
-                            am = re.search(r'Areal\s*m\s*2\s+([\d,.]+)', context)
-                            if am:
-                                try:
-                                    qty = float(am.group(1).replace(',', '.'))
-                                    unit = 'm2'
-                                except ValueError:
-                                    pass
-
-                        new_posts.append(Post(
-                            post_number=full_pn,
-                            ns3420_code=parent.ns3420_code,
-                            subject=parent.subject,
-                            description=desc_text[:200] if desc_text else parent.description,
-                            quantity=qty,
-                            unit=unit,
-                            chapter_code=parent.chapter_code,
-                            chapter_title=parent.chapter_title,
-                            section_code=parent.section_code,
-                            section_title=parent.section_title,
-                            page=parent.page,
-                        ))
-                        break  # Only first sub-number per split match
-
-        # Deduplicate: prefer posts with quantity over those without
-        existing = {p.post_number for p in self.posts}
-        for np in new_posts:
-            if np.post_number not in existing:
-                self.posts.append(np)
-                existing.add(np.post_number)
-
-        # Sort by post number
-        self.posts.sort(key=lambda p: self._sort_key(p.post_number))
+    @staticmethod
+    def _normalize_unit(unit: str) -> str:
+        """Normalize unit strings: m2->m², m3->m³."""
+        unit = unit.replace('m2', 'm²').replace('m3', 'm³')
+        return unit
 
     @staticmethod
     def _sort_key(postnr: str) -> List:
@@ -1200,55 +1034,6 @@ class NS3420Parser:
             except ValueError:
                 result.append((1, p))
         return result
-
-    def _detect_sub_number(self, post: Post, clean_lines: List[str]):
-        """Detect sub-item number and append to post number.
-
-        Handles:
-        - '1.1 GLIDESJIKT'  -> sub-post, append '.1.1'
-        - '0 GEOTEKSTIL...' -> continuation digit, append '0' (no dot)
-        - standalone '2'/'3' followed by 'Areal'/'Volum' -> m²/m³ superscript, SKIP
-        """
-        for i, cl in enumerate(clean_lines[1:4], 1):
-            stripped = cl.strip()
-            # Pattern 1: "N.M DESCRIPTION" -> sub-post number (with dots)
-            m = re.match(r'^(\d+\.\d+)\s+[A-ZÆØÅ]', stripped)
-            if m:
-                sub = m.group(1)
-                post.post_number = f"{post.post_number}.{sub}"
-                return
-
-            # Standalone digit: check context to decide what it means
-            if re.match(r'^\d{1,2}$', stripped):
-                digit = stripped
-                # Check next line
-                next_line = clean_lines[i + 1].strip() if i + 1 < len(clean_lines) else ""
-                next_lower = next_line.lower()
-                # Skip if it's a m²/m³ superscript (digit 2/3 before Areal/Volum/Prosjektert)
-                if digit in ('2', '3') and any(
-                    next_lower.startswith(w)
-                    for w in ('areal', 'volum', 'prosjektert', 'forskalings', 'm2', 'm3')
-                ):
-                    continue
-                # Otherwise it's a continuation of the post number
-                alpha = re.sub(r'[^a-zA-ZæøåÆØÅ]', '', next_line)
-                is_caps = len(alpha) >= 3 and sum(1 for c in alpha if c.isupper()) / len(alpha) > 0.6
-                if is_caps:
-                    post.post_number = f"{post.post_number}{digit}"
-                    return
-
-            # Pattern 3: "N CAPS_DESCRIPTION" where N is single digit -> continuation
-            # E.g., 73.731.13 + "0 GEOTEKSTIL" = 73.731.130
-            m = re.match(r'^(\d)\s+[A-ZÆØÅ]{3,}', stripped)
-            if m:
-                digit = m.group(1)
-                # Get the text after the digit
-                desc_after = stripped[len(digit):].strip()
-                # Skip if this looks like a quantity line (not a postnr continuation)
-                if re.match(r'^(Antall|Areal|Lengde|Masse|Volum|Rund)', desc_after, re.I):
-                    continue
-                post.post_number = f"{post.post_number}{digit}"
-                return
 
     def _extract_quantity(self, post: Post, clean_text: str):
         """Ekstraher mengde og enhet."""
@@ -1264,7 +1049,7 @@ class NS3420Parser:
                     val = float(qty_str)
                     if val > 0:
                         post.quantity = val
-                        post.unit = unit
+                        post.unit = self._normalize_unit(unit)
                         return
                 except (ValueError, IndexError):
                     continue
